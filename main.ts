@@ -1,538 +1,727 @@
-// Velmaris — a travel poster for a place that isn't there.
+// AERTHYS — The Floating Isles
+// A travel poster for a place that does not exist, drawn entirely in code.
+// Pure Node.js stdlib (node:fs, node:path, node:zlib). No network, no assets,
+// no randomness: every run writes the exact same bytes to entry.png.
 //
-// A dependency-free Node 22 program: it renders a 1024x1024 travel poster
-// for the invented island of VELMARIS (a floating rock isle with a lighthouse,
-// a waterfall pouring into a golden lagoon) and writes it to /output/entry.png.
-// Pure TypeScript + node:zlib / node:fs only — no network, no fonts, no deps.
-// The lettering is a hand-drawn 5x7 bitmap font scaled up; the scene is
-// painted pixel by pixel from gradients and shape tests, deterministically
-// (seeded PRNG), so every run produces the same poster.
+// The poster: a sunset sky over a sea of clouds, a floating island crowned
+// by a striped lighthouse, a waterfall spilling off its edge, a small
+// hot-air balloon drifting by — and the name AERTHYS set large across the sky.
 
-import { deflateSync } from "node:zlib";
-import { mkdirSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as zlib from "node:zlib";
 
-const W = 1024;
-const H = 1024;
-const HORIZON = 600;
-const OUT = "/output/entry.png";
+// ---------------------------------------------------------------------------
+// Canvas: a 1024x1024 RGB image, rendered at 2x supersampling (2048x2048)
+// and box-downsampled for smooth anti-aliased edges.
+// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------- utilities
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
+const OUT_W = 1024;
+const OUT_H = 1024;
+const SS = 2; // supersampling factor
+const W = OUT_W * SS;
+const H = OUT_H * SS;
+
+type RGB = [number, number, number];
+
+const buf = new Float32Array(W * H * 3);
+
+function clamp255(v: number): number {
+  return v < 0 ? 0 : v > 255 ? 255 : v;
 }
+
+function setPx(x: number, y: number, r: number, g: number, b: number): void {
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const i = (y * W + x) * 3;
+  buf[i] = r;
+  buf[i + 1] = g;
+  buf[i + 2] = b;
+}
+
+// Blend a colour over the pixel at (x, y) with opacity a in [0, 1].
+function blendPx(x: number, y: number, r: number, g: number, b: number, a: number): void {
+  if (a <= 0) return;
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const i = (y * W + x) * 3;
+  if (a >= 1) {
+    buf[i] = r;
+    buf[i + 1] = g;
+    buf[i + 2] = b;
+  } else {
+    buf[i] = buf[i] * (1 - a) + r * a;
+    buf[i + 1] = buf[i + 1] * (1 - a) + g * a;
+    buf[i + 2] = buf[i + 2] * (1 - a) + b * a;
+  }
+}
+
+// Hex colour like "#f2a65a" -> [r, g, b].
+function hex(c: string): RGB {
+  const n = parseInt(c.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
 function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
-function smoothstep(a: number, b: number, v: number): number {
-  const t = clamp((v - a) / (b - a), 0, 1);
-  return t * t * (3 - 2 * t);
-}
-type RGB = [number, number, number];
-function mix(a: RGB, b: RGB, t: number): RGB {
-  return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+
+function lerpColor(c1: RGB, c2: RGB, t: number): RGB {
+  return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
 }
 
-// Deterministic PRNG (mulberry32) + value noise, so the poster is identical
-// on every run.
-function mulberry32(seed: number): () => number {
-  let s = seed >>> 0;
-  return () => {
-    s = (s + 0x6d2b79f5) >>> 0;
-    let t = s;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-const rand = mulberry32(20261121);
-function hash1(n: number): number {
-  const s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
-  return s - Math.floor(s);
-}
-function noise1(x: number): number {
-  const i = Math.floor(x);
-  const f = x - i;
-  const u = f * f * (3 - 2 * f);
-  return lerp(hash1(i), hash1(i + 1), u);
-}
-function noise2(x: number, y: number): number {
-  const xi = Math.floor(x);
-  const yi = Math.floor(y);
-  const xf = x - xi;
-  const yf = y - yi;
-  const u = xf * xf * (3 - 2 * xf);
-  const v = yf * yf * (3 - 2 * yf);
-  const a = hash1(xi * 57 + yi * 131);
-  const b = hash1((xi + 1) * 57 + yi * 131);
-  const c = hash1(xi * 57 + (yi + 1) * 131);
-  const d = hash1((xi + 1) * 57 + (yi + 1) * 131);
-  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+// ---------------------------------------------------------------------------
+// Fills
+// ---------------------------------------------------------------------------
+
+// Vertical gradient across the whole canvas. Stops are [position 0..1, colour].
+function vgrad(stops: Array<[number, RGB]>): void {
+  for (let y = 0; y < H; y++) {
+    const t = y / (H - 1);
+    let k = 0;
+    while (k < stops.length - 2 && t > stops[k + 1][0]) k++;
+    const [p0, c0] = stops[k];
+    const [p1, c1] = stops[k + 1];
+    const f = p1 === p0 ? 0 : (t - p0) / (p1 - p0);
+    const c = lerpColor(c0, c1, Math.max(0, Math.min(1, f)));
+    for (let x = 0; x < W; x++) setPx(x, y, c[0], c[1], c[2]);
+  }
 }
 
-// ------------------------------------------------------------------- bitmap font
-// 5x7 glyphs, rows top to bottom, '#' = ink.
-const FONT: Record<string, string[]> = {
-  A: [" ### ", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"],
-  B: ["#### ", "#   #", "#   #", "#### ", "#   #", "#   #", "#### "],
-  C: [" ####", "#    ", "#    ", "#    ", "#    ", "#    ", " ####"],
-  D: ["#### ", "#   #", "#   #", "#   #", "#   #", "#   #", "#### "],
-  E: ["#####", "#    ", "#    ", "#### ", "#    ", "#    ", "#####"],
-  F: ["#####", "#    ", "#    ", "#### ", "#    ", "#    ", "#    "],
-  G: [" ####", "#    ", "#    ", "# ###", "#   #", "#   #", " ### "],
-  H: ["#   #", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"],
-  I: ["#####", "  #  ", "  #  ", "  #  ", "  #  ", "  #  ", "#####"],
-  J: ["  ###", "   # ", "   # ", "   # ", "   # ", "#  # ", " ##  "],
-  K: ["#   #", "#  # ", "# #  ", "##   ", "# #  ", "#  # ", "#   #"],
-  L: ["#    ", "#    ", "#    ", "#    ", "#    ", "#    ", "#####"],
-  M: ["#   #", "## ##", "# # #", "# # #", "#   #", "#   #", "#   #"],
-  N: ["#   #", "##  #", "##  #", "# # #", "#  ##", "#  ##", "#   #"],
-  O: [" ### ", "#   #", "#   #", "#   #", "#   #", "#   #", " ### "],
-  P: ["#### ", "#   #", "#   #", "#### ", "#    ", "#    ", "#    "],
-  Q: [" ### ", "#   #", "#   #", "#   #", "# # #", "#  # ", " ## #"],
-  R: ["#### ", "#   #", "#   #", "#### ", "# #  ", "#  # ", "#   #"],
-  S: [" ####", "#    ", "#    ", " ### ", "    #", "    #", "#### "],
-  T: ["#####", "  #  ", "  #  ", "  #  ", "  #  ", "  #  ", "  #  "],
-  U: ["#   #", "#   #", "#   #", "#   #", "#   #", "#   #", " ### "],
-  V: ["#   #", "#   #", "#   #", "#   #", "#   #", " # # ", "  #  "],
-  W: ["#   #", "#   #", "#   #", "# # #", "# # #", "## ##", "#   #"],
-  X: ["#   #", "#   #", " # # ", "  #  ", " # # ", "#   #", "#   #"],
-  Y: ["#   #", "#   #", " # # ", "  #  ", "  #  ", "  #  ", "  #  "],
-  Z: ["#####", "    #", "   # ", "  #  ", " #   ", "#    ", "#####"],
-  "0": [" ### ", "#   #", "#  ##", "# # #", "##  #", "#   #", " ### "],
-  "1": ["  #  ", " ##  ", "  #  ", "  #  ", "  #  ", "  #  ", " ### "],
-  "2": [" ### ", "#   #", "    #", "   # ", "  #  ", " #   ", "#####"],
-  "3": ["#### ", "    #", "    #", " ### ", "    #", "    #", "#### "],
-  "4": ["   # ", "  ## ", " # # ", "#  # ", "#####", "   # ", "   # "],
-  "5": ["#####", "#    ", "#### ", "    #", "    #", "#   #", " ### "],
-  "6": [" ### ", "#    ", "#    ", "#### ", "#   #", "#   #", " ### "],
-  "7": ["#####", "    #", "   # ", "  #  ", " #   ", " #   ", " #   "],
-  "8": [" ### ", "#   #", "#   #", " ### ", "#   #", "#   #", " ### "],
-  "9": [" ### ", "#   #", "#   #", " ####", "    #", "    #", " ### "],
-  " ": ["     ", "     ", "     ", "     ", "     ", "     ", "     "],
-  ".": ["     ", "     ", "     ", "     ", "     ", " ##  ", " ##  "],
-  "-": ["     ", "     ", "     ", "#####", "     ", "     ", "     "],
-  "'": ["  #  ", "  #  ", "     ", "     ", "     ", "     ", "     "],
+function fillRect(x0: number, y0: number, x1: number, y1: number, c: RGB, a = 1): void {
+  const xa = Math.max(0, Math.floor(x0));
+  const xb = Math.min(W - 1, Math.ceil(x1));
+  const ya = Math.max(0, Math.floor(y0));
+  const yb = Math.min(H - 1, Math.ceil(y1));
+  for (let y = ya; y <= yb; y++) {
+    for (let x = xa; x <= xb; x++) blendPx(x, y, c[0], c[1], c[2], a);
+  }
+}
+
+// Filled circle, optionally with a radial gradient from centre to edge.
+function fillCircle(cx: number, cy: number, r: number, c: RGB, a = 1, edge?: RGB): void {
+  const xa = Math.max(0, Math.floor(cx - r));
+  const xb = Math.min(W - 1, Math.ceil(cx + r));
+  const ya = Math.max(0, Math.floor(cy - r));
+  const yb = Math.min(H - 1, Math.ceil(cy + r));
+  const rr = r * r;
+  for (let y = ya; y <= yb; y++) {
+    for (let x = xa; x <= xb; x++) {
+      const dx = x + 0.5 - cx;
+      const dy = y + 0.5 - cy;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > rr) continue;
+      // Soft 1.5px edge.
+      const d = Math.sqrt(d2);
+      let cov = 1;
+      if (d > r - 1.5) cov = Math.max(0, (r - d) / 1.5);
+      if (edge) {
+        const cc = lerpColor(c, edge, d / r);
+        blendPx(x, y, cc[0], cc[1], cc[2], a * cov);
+      } else {
+        blendPx(x, y, c[0], c[1], c[2], a * cov);
+      }
+    }
+  }
+}
+
+function fillEllipse(cx: number, cy: number, rx: number, ry: number, c: RGB, a = 1): void {
+  const xa = Math.max(0, Math.floor(cx - rx));
+  const xb = Math.min(W - 1, Math.ceil(cx + rx));
+  const ya = Math.max(0, Math.floor(cy - ry));
+  const yb = Math.min(H - 1, Math.ceil(cy + ry));
+  for (let y = ya; y <= yb; y++) {
+    for (let x = xa; x <= xb; x++) {
+      const dx = (x + 0.5 - cx) / rx;
+      const dy = (y + 0.5 - cy) / ry;
+      const d = dx * dx + dy * dy;
+      if (d > 1) continue;
+      let cov = 1;
+      if (d > 0.94) cov = Math.max(0, (1 - d) / 0.06);
+      blendPx(x, y, c[0], c[1], c[2], a * cov);
+    }
+  }
+}
+
+// Point-in-polygon (even-odd) test.
+function insidePoly(px: number, py: number, pts: Array<[number, number]>): boolean {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const [xi, yi] = pts[i];
+    const [xj, yj] = pts[j];
+    if (yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function fillPoly(pts: Array<[number, number]>, c: RGB, a = 1): void {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const [x, y] of pts) {
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+  }
+  const xa = Math.max(0, Math.floor(minX));
+  const xb = Math.min(W - 1, Math.ceil(maxX));
+  const ya = Math.max(0, Math.floor(minY));
+  const yb = Math.min(H - 1, Math.ceil(maxY));
+  for (let y = ya; y <= yb; y++) {
+    for (let x = xa; x <= xb; x++) {
+      if (insidePoly(x + 0.5, y + 0.5, pts)) blendPx(x, y, c[0], c[1], c[2], a);
+    }
+  }
+}
+
+// Thick line segment with round caps.
+function thickLine(x0: number, y0: number, x1: number, y1: number, w: number, c: RGB, a = 1): void {
+  const r = w / 2;
+  const xa = Math.max(0, Math.floor(Math.min(x0, x1) - r - 1));
+  const xb = Math.min(W - 1, Math.ceil(Math.max(x0, x1) + r + 1));
+  const ya = Math.max(0, Math.floor(Math.min(y0, y1) - r - 1));
+  const yb = Math.min(H - 1, Math.ceil(Math.max(y0, y1) + r + 1));
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const len2 = dx * dx + dy * dy;
+  for (let y = ya; y <= yb; y++) {
+    for (let x = xa; x <= xb; x++) {
+      const px = x + 0.5;
+      const py = y + 0.5;
+      let t = len2 === 0 ? 0 : ((px - x0) * dx + (py - y0) * dy) / len2;
+      t = Math.max(0, Math.min(1, t));
+      const qx = x0 + t * dx;
+      const qy = y0 + t * dy;
+      const d = Math.hypot(px - qx, py - qy);
+      if (d > r) continue;
+      let cov = 1;
+      if (d > r - 1.2) cov = Math.max(0, (r - d) / 1.2);
+      blendPx(x, y, c[0], c[1], c[2], a * cov);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vector stroke font (my own letterforms, on a 10 wide x 14 tall grid).
+// Each glyph is a list of polylines; rendered as thick round-capped strokes.
+// ---------------------------------------------------------------------------
+
+type Glyph = Array<Array<[number, number]>>;
+
+const FONT: Record<string, Glyph> = {
+  A: [[[0, 14], [5, 0], [10, 14]], [[2.6, 9], [7.4, 9]]],
+  B: [[[0, 0], [0, 14]], [[0, 0], [6.5, 0], [9, 2.5], [9, 5], [6.5, 7], [0, 7]], [[6.5, 7], [9, 9.5], [9, 11.5], [6.5, 14], [0, 14]]],
+  C: [[[9.5, 3], [7, 0], [3, 0], [0, 3], [0, 11], [3, 14], [7, 14], [9.5, 11]]],
+  D: [[[0, 0], [0, 14], [6, 14], [9.5, 11], [9.5, 3], [6, 0], [0, 0]]],
+  E: [[[9, 0], [0, 0], [0, 14], [9, 14]], [[0, 7], [6.5, 7]]],
+  F: [[[0, 14], [0, 0], [9, 0]], [[0, 7], [6.5, 7]]],
+  G: [[[9.5, 3], [7, 0], [3, 0], [0, 3], [0, 11], [3, 14], [7, 14], [10, 11], [10, 7], [5, 7]]],
+  H: [[[0, 0], [0, 14]], [[10, 0], [10, 14]], [[0, 7], [10, 7]]],
+  I: [[[5, 0], [5, 14]], [[2, 0], [8, 0]], [[2, 14], [8, 14]]],
+  J: [[[8, 0], [8, 11], [6, 14], [2.5, 14], [0.5, 11]]],
+  K: [[[0, 0], [0, 14]], [[9.5, 0], [0, 7], [9.5, 14]]],
+  L: [[[0, 0], [0, 14], [9, 14]]],
+  M: [[[0, 14], [0, 0], [5, 8], [10, 0], [10, 14]]],
+  N: [[[0, 14], [0, 0], [10, 14], [10, 0]]],
+  O: [[[3, 0], [7, 0], [10, 3], [10, 11], [7, 14], [3, 14], [0, 11], [0, 3], [3, 0]]],
+  P: [[[0, 14], [0, 0], [7, 0], [9.5, 2.5], [9.5, 5], [7, 7], [0, 7]]],
+  Q: [[[3, 0], [7, 0], [10, 3], [10, 11], [7, 14], [3, 14], [0, 11], [0, 3], [3, 0]], [[6, 10], [10, 14]]],
+  R: [[[0, 14], [0, 0], [7, 0], [9.5, 2.5], [9.5, 5], [7, 7], [0, 7]], [[6, 7], [10, 14]]],
+  S: [[[9.5, 3], [7, 0], [3, 0], [1, 2], [1, 5], [3, 7], [7, 7], [9, 9], [9, 12], [7, 14], [3, 14], [0.5, 11]]],
+  T: [[[0, 0], [10, 0]], [[5, 0], [5, 14]]],
+  U: [[[0, 0], [0, 11], [2, 14], [8, 14], [10, 11], [10, 0]]],
+  V: [[[0, 0], [5, 14], [10, 0]]],
+  W: [[[0, 0], [2.5, 14], [5, 7], [7.5, 14], [10, 0]]],
+  X: [[[0, 0], [10, 14]], [[10, 0], [0, 14]]],
+  Y: [[[0, 0], [5, 7], [10, 0]], [[5, 7], [5, 14]]],
+  Z: [[[0, 0], [10, 0], [0, 14], [10, 14]]],
+  " ": [],
+  "'": [[[5, 0], [5, 4]]],
+  "-": [[[1, 7], [9, 7]]],
+  ".": [[[5, 13], [5, 14]]],
 };
 
-// ------------------------------------------------------------------- PNG writer
-const CRC_TABLE: number[] = (() => {
-  const t: number[] = [];
+// Width of one glyph cell (in grid units) plus tracking; narrow letters get
+// a smaller advance so the setting does not look gappy.
+function glyphAdvance(ch: string): number {
+  if (ch === "I") return 7.5;
+  if (ch === " ") return 6;
+  if (ch === "'") return 4;
+  if (ch === ".") return 4;
+  if (ch === "J") return 8;
+  return 11;
+}
+
+function textWidth(text: string, scale: number): number {
+  let w = 0;
+  for (const ch of text) w += glyphAdvance(ch) * scale;
+  return w - 1.5 * scale; // drop trailing tracking
+}
+
+// Draw text with its top-left at (x, y); scale = pixels per grid unit.
+function drawText(x: number, y: number, text: string, scale: number, stroke: number, c: RGB, a = 1): void {
+  let cx = x;
+  for (const ch of text) {
+    const glyph = FONT[ch.toUpperCase()];
+    if (glyph) {
+      for (const poly of glyph) {
+        for (let i = 0; i < poly.length - 1; i++) {
+          const [ax, ay] = poly[i];
+          const [bx, by] = poly[i + 1];
+          thickLine(cx + ax * scale, y + ay * scale, cx + bx * scale, y + by * scale, stroke, c, a);
+        }
+      }
+    }
+    cx += glyphAdvance(ch) * scale;
+  }
+}
+
+function drawTextCentred(cx: number, y: number, text: string, scale: number, stroke: number, c: RGB, a = 1): void {
+  drawText(cx - textWidth(text, scale) / 2, y, text, scale, stroke, c, a);
+}
+
+// ---------------------------------------------------------------------------
+// PNG encoder (colour type 2, RGB, 8 bit). One filter per row, chosen by the
+// smallest sum of absolute signed byte values; zlib level 9.
+// ---------------------------------------------------------------------------
+
+function crc32Table(): Uint32Array {
+  const t = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t.push(c >>> 0);
+    t[n] = c >>> 0;
   }
   return t;
-})();
+}
+const CRC_TABLE = crc32Table();
+
 function crc32(buf: Buffer): number {
   let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 255] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
-function chunk(type: string, data: Buffer): Buffer {
+
+function pngChunk(type: string, data: Buffer): Buffer {
   const len = Buffer.alloc(4);
   len.writeUInt32BE(data.length, 0);
-  const td = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  const typeBuf = Buffer.from(type, "ascii");
   const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(td), 0);
-  return Buffer.concat([len, td, crc]);
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crc]);
 }
-function encodePNG(rgb: Uint8Array, w: number, h: number): Buffer {
-  // One scanline per row: filter byte + RGB. Choose per row between
-  // filter 0 (None) and filter 2 (Up) by smallest sum of absolute bytes.
-  const stride = w * 3;
-  const raw = Buffer.alloc(h * (stride + 1));
-  const prev = Buffer.alloc(stride);
-  for (let y = 0; y < h; y++) {
-    const row = rgb.subarray(y * stride, (y + 1) * stride);
-    let sum0 = 0;
-    let sum2 = 0;
-    for (let i = 0; i < stride; i++) {
-      sum0 += Math.abs(row[i]);
-      sum2 += Math.abs(row[i] - prev[i]);
-    }
-    const off = y * (stride + 1);
-    if (sum2 < sum0) {
-      raw[off] = 2;
-      for (let i = 0; i < stride; i++) raw[off + 1 + i] = (row[i] - prev[i]) & 0xff;
-    } else {
-      raw[off] = 0;
-      Buffer.from(row).copy(raw, off + 1);
-    }
-    Buffer.from(row).copy(prev);
-  }
+
+function encodePNG(rgb: Buffer, w: number, h: number): Buffer {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(w, 0);
   ihdr.writeUInt32BE(h, 4);
   ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // truecolour
-  const idat = deflateSync(raw, { level: 9 });
+  ihdr[9] = 2; // colour type 2 = RGB
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  // Filter each row: try filters 0..4, keep the one with the smallest
+  // sum of absolute values of the signed filtered bytes.
+  const raw = Buffer.alloc((w * 3 + 1) * h);
+  const prev = Buffer.alloc(w * 3);
+  const filt = Buffer.alloc(w * 3);
+  for (let y = 0; y < h; y++) {
+    const row = rgb.subarray(y * w * 3, (y + 1) * w * 3);
+    let bestType = 0;
+    let bestScore = Infinity;
+    let best = Buffer.alloc(w * 3);
+    for (let f = 0; f <= 4; f++) {
+      let score = 0;
+      for (let i = 0; i < w * 3; i++) {
+        const left = i >= 3 ? row[i - 3] : 0;
+        const up = prev[i];
+        const upLeft = i >= 3 ? prev[i - 3] : 0;
+        let p: number;
+        if (f === 0) p = row[i];
+        else if (f === 1) p = row[i] - left;
+        else if (f === 2) p = row[i] - up;
+        else if (f === 3) p = row[i] - ((left + up) >> 1);
+        else {
+          const pa = Math.abs(up - upLeft);
+          const pb = Math.abs(left - upLeft);
+          const pc = Math.abs(left + up - 2 * upLeft);
+          // Standard Paeth: pick the nearest of left / up / up-left.
+          const pr = pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft;
+          p = row[i] - pr;
+        }
+        const b = p & 255;
+        filt[i] = b;
+        score += b < 128 ? b : 256 - b;
+      }
+      if (score < bestScore) {
+        bestScore = score;
+        bestType = f;
+        best = Buffer.from(filt);
+      }
+    }
+    raw[y * (w * 3 + 1)] = bestType;
+    best.copy(raw, y * (w * 3 + 1) + 1);
+    row.copy(prev);
+  }
+  const idat = zlib.deflateSync(raw, { level: 9 });
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    chunk("IHDR", ihdr),
-    chunk("IDAT", idat),
-    chunk("IEND", Buffer.alloc(0)),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", idat),
+    pngChunk("IEND", Buffer.alloc(0)),
   ]);
 }
 
-// ------------------------------------------------------------------- the poster
-const img = new Uint8Array(W * H * 3);
-function px(x: number, y: number): number {
-  return (y * W + x) * 3;
-}
-function setPix(x: number, y: number, c: RGB): void {
-  if (x < 0 || x >= W || y < 0 || y >= H) return;
-  const o = px(x, y);
-  img[o] = clamp(Math.round(c[0]), 0, 255);
-  img[o + 1] = clamp(Math.round(c[1]), 0, 255);
-  img[o + 2] = clamp(Math.round(c[2]), 0, 255);
-}
-function blendPix(x: number, y: number, c: RGB, a: number): void {
-  if (x < 0 || x >= W || y < 0 || y >= H || a <= 0) return;
-  const o = px(x, y);
-  img[o] = clamp(Math.round(lerp(img[o], c[0], a)), 0, 255);
-  img[o + 1] = clamp(Math.round(lerp(img[o + 1], c[1], a)), 0, 255);
-  img[o + 2] = clamp(Math.round(lerp(img[o + 2], c[2], a)), 0, 255);
+// ---------------------------------------------------------------------------
+// The poster. All scene coordinates are in 1024-space and scaled by SS.
+// ---------------------------------------------------------------------------
+
+const s = (v: number): number => v * SS;
+
+// Sunset sky.
+function drawSky(): void {
+  vgrad([
+    [0.0, hex("#1d0f3e")],
+    [0.28, hex("#4a2560")],
+    [0.5, hex("#8e3a63")],
+    [0.66, hex("#d4695c")],
+    [0.8, hex("#f2a65a")],
+    [1.0, hex("#ffd98a")],
+  ]);
 }
 
-// Sky stops (golden hour) and sea stops.
-const SKY: [number, RGB][] = [
-  [0.0, [26, 48, 84]],
-  [0.22, [62, 105, 148]],
-  [0.42, [214, 148, 106]],
-  [0.55, [247, 196, 116]],
-  [0.585, [250, 214, 140]],
-];
-const SEA: [number, RGB][] = [
-  [0.0, [64, 138, 148]],
-  [0.25, [38, 106, 128]],
-  [0.6, [20, 70, 102]],
-  [1.0, [10, 42, 72]],
-];
-function ramp(stops: [number, RGB][], t: number): RGB {
-  const tt = clamp(t, 0, 1);
-  for (let i = 0; i < stops.length - 1; i++) {
-    if (tt <= stops[i + 1][0]) {
-      const f = (tt - stops[i][0]) / (stops[i + 1][0] - stops[i][0]);
-      return mix(stops[i][1], stops[i + 1][1], clamp(f, 0, 1));
-    }
-  }
-  return stops[stops.length - 1][1];
-}
-
-const SUN_X = 712;
-const SUN_Y = 486;
-const SUN_R = 52;
-
-// Soft clouds, fixed by the seeded rng.
-const CLOUDS = Array.from({ length: 9 }, (_, i) => ({
-  x: 60 + rand() * 900,
-  y: 210 + rand() * 300,
-  rx: 90 + rand() * 150,
-  ry: 14 + rand() * 22,
-  a: 0.10 + rand() * 0.14,
-}));
-
-function ridgeY(x: number, base: number, amp: number, freq: number): number {
-  return base - amp * (0.55 + 0.45 * noise1(x * freq));
-}
-
-function render(): void {
-  // 1. Base sky + sea, sun glow, sun disc, sea glitter.
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      let c: RGB;
-      if (y < HORIZON) {
-        c = ramp(SKY, y / HORIZON);
-        // Sun glow.
-        const dx = x - SUN_X;
-        const dy = (y - SUN_Y) * 1.15;
-        const d = Math.sqrt(dx * dx + dy * dy);
-        const glow = Math.exp(-(d * d) / (2 * 190 * 190));
-        c = mix(c, [255, 214, 150], glow * 0.55);
-        if (d < SUN_R) {
-          const edge = smoothstep(SUN_R, SUN_R - 6, d);
-          c = mix(c, [255, 214, 128], 0.35 + 0.65 * edge);
-        }
-      } else {
-        const t = (y - HORIZON) / (H - HORIZON);
-        c = ramp(SEA, t);
-        // Sun glitter column on the water.
-        const halfW = 46 + t * 150;
-        const dx = Math.abs(x - SUN_X);
-        if (dx < halfW) {
-          const shimmer = 0.5 + 0.5 * noise2(x * 0.045, y * 0.11);
-          const fall = (1 - dx / halfW) * (1 - t * 0.55);
-          const g = shimmer * fall;
-          c = mix(c, [255, 205, 130], g * 0.5);
-          if (shimmer > 0.86) c = mix(c, [255, 240, 200], (shimmer - 0.86) * 3 * fall);
-        }
-        // Gentle wave striping.
-        const w = Math.sin(y * 0.55 + noise1(x * 0.02) * 6) * 0.5 + 0.5;
-        if (w > 0.93) c = mix(c, [140, 200, 210], (w - 0.93) * 4 * 0.25);
-      }
-      setPix(x, y, c);
-    }
-  }
-
-  // 2. Clouds (soft ellipses, warm-lit).
-  for (const cl of CLOUDS) {
-    const x0 = Math.max(0, Math.floor(cl.x - cl.rx));
-    const x1 = Math.min(W - 1, Math.ceil(cl.x + cl.rx));
-    const y0 = Math.max(0, Math.floor(cl.y - cl.ry * 2));
-    const y1 = Math.min(HORIZON - 1, Math.ceil(cl.y + cl.ry * 2));
-    for (let y = y0; y <= y1; y++) {
-      for (let x = x0; x <= x1; x++) {
-        const ex = (x - cl.x) / cl.rx;
-        const ey = (y - cl.y) / cl.ry;
-        const d2 = ex * ex + ey * ey;
-        if (d2 < 1) {
-          const a = cl.a * smoothstep(1, 0.55, d2) * (0.75 + 0.25 * noise2(x * 0.05, y * 0.2));
-          const lit: RGB = y < cl.y ? [255, 226, 180] : [244, 190, 150];
-          blendPix(x, y, lit, a);
-        }
-      }
-    }
-  }
-
-  // 3. Distant ridge silhouettes along the horizon (two hazy layers).
-  for (const layer of [
-    { base: HORIZON - 26, amp: 46, freq: 0.006, col: [96, 116, 158] as RGB, alpha: 0.55 },
-    { base: HORIZON - 8, amp: 30, freq: 0.011, col: [58, 82, 122] as RGB, alpha: 0.8 },
-  ]) {
-    for (let x = 0; x < W; x++) {
-      const ry = ridgeY(x, layer.base, layer.amp, layer.freq);
-      for (let y = Math.max(0, Math.floor(ry)); y < HORIZON; y++) {
-        const edge = smoothstep(ry + 3, ry, y);
-        blendPix(x, y, layer.col, layer.alpha * (0.35 + 0.65 * edge));
-      }
-    }
-  }
-
-  // 4. The floating isle of Velmaris — rock, grass, trees, lighthouse,
-  //    waterfall. Centre-left, hovering above the lagoon.
-  const IX = 400;
-  const ITOP = 372; // grass line
-  const ITIP = 528; // underside tip
-  const IRX = 196; // half width at the grass line
-  for (let y = 330; y <= ITIP + 6; y++) {
-    // Half-width profile: wide flat top, tapering to a point below.
-    let hw: number;
-    if (y < ITOP) hw = 0;
-    else if (y < 428) hw = IRX * (0.94 + 0.06 * Math.cos(((y - ITOP) / 56) * Math.PI));
-    else hw = IRX * Math.pow(1 - (y - 428) / (ITIP - 428), 0.72);
-    const wob = (noise1(y * 0.09) - 0.5) * 14;
-    const cx = IX + wob * 0.4;
-    const x0 = Math.max(0, Math.floor(cx - hw));
-    const x1 = Math.min(W - 1, Math.ceil(cx + hw));
-    for (let x = x0; x <= x1; x++) {
-      const edge = clamp((hw - Math.abs(x - cx)) / 10, 0, 1);
-      const t = clamp((y - ITOP) / (ITIP - ITOP), 0, 1);
-      let c = mix([122, 84, 66], [52, 38, 48], t); // sunlit rock to shadowed base
-      // Grassy crown.
-      if (y < ITOP + 16) c = mix([198, 164, 92], [128, 158, 82], clamp((y - ITOP) / 16, 0, 1));
-      // Warm rim light on the sun side (right edge).
-      const rim = smoothstep(0.55, 1, (x - cx) / Math.max(hw, 1));
-      if (rim > 0) c = mix(c, [232, 170, 110], rim * 0.5 * (1 - t * 0.5));
-      blendPix(x, y, c, 0.35 + 0.65 * edge);
-    }
-  }
-  // Trees: dark green tufts on the grass.
-  for (const [tx, ty, tr] of [
-    [300, 366, 15],
-    [330, 360, 19],
-    [470, 362, 17],
-    [505, 368, 12],
-  ] as const) {
-    for (let y = ty - tr; y <= ty + 4; y++) {
-      for (let x = tx - tr; x <= tx + tr; x++) {
-        const dx = (x - tx) / tr;
-        const dy = (y - ty) / (tr * 0.8);
-        if (dx * dx + dy * dy < 1) blendPix(x, y, [46, 92, 58], 0.9);
-      }
-    }
-  }
-  // Lighthouse on the isle: white tower, coral bands, lamp room, light beams.
-  const LX = IX;
-  const LTOP = 268;
-  const LBOT = ITOP + 2;
-  for (let y = LTOP; y <= LBOT; y++) {
-    const taper = lerp(11, 15, (y - LTOP) / (LBOT - LTOP));
-    for (let x = Math.floor(LX - taper); x <= Math.ceil(LX + taper); x++) {
-      let c: RGB = [248, 244, 232];
-      if ((y > 300 && y < 318) || (y > 340 && y < 356)) c = [214, 92, 74]; // coral bands
-      if (x > LX + taper - 3) c = mix(c, [120, 110, 110], 0.45); // shaded side
-      setPix(x, y, c);
-    }
-  }
-  // Gallery + lamp room + dome.
-  for (let y = LTOP - 26; y < LTOP; y++) {
-    const hw = y < LTOP - 14 ? 9 : 15;
-    for (let x = LX - hw; x <= LX + hw; x++) {
-      setPix(x, y, y < LTOP - 14 ? [52, 48, 52] : [40, 40, 46]);
-    }
-  }
-  for (let y = LTOP - 34; y < LTOP - 26; y++) {
-    const hw = 12 - (LTOP - 26 - y);
-    for (let x = LX - hw; x <= LX + hw; x++) setPix(x, y, [214, 92, 74]);
-  }
-  // Lamp glow.
-  for (let y = LTOP - 40; y <= LTOP + 8; y++) {
-    for (let x = LX - 30; x <= LX + 30; x++) {
-      const d = Math.sqrt((x - LX) * (x - LX) + (y - (LTOP - 16)) * (y - (LTOP - 16)));
-      if (d < 30) blendPix(x, y, [255, 240, 180], (1 - d / 30) * 0.5);
-    }
-  }
-  // Light beams sweeping to both sides.
-  for (const dir of [-1, 1]) {
-    for (let s = 0; s < 260; s++) {
-      const bx = LX + dir * (20 + s);
-      const by = LTOP - 16 + Math.round(s * 0.10);
-      const spread = 4 + s * 0.05;
-      for (let y = Math.floor(by - spread); y <= Math.ceil(by + spread); y++) {
-        const a = 0.42 * (1 - s / 260) * (1 - Math.abs(y - by) / spread);
-        blendPix(bx, y, [255, 238, 170], Math.max(0, a));
-      }
-    }
-  }
-
-  // Waterfall from the isle's tip down to the lagoon, with foam.
-  for (let y = ITIP - 4; y < HORIZON + 2; y++) {
-    const t = (y - ITIP) / (HORIZON - ITIP);
-    const hw = 10 + t * 22;
-    const cx = IX + Math.sin(y * 0.05) * 4 + t * 10;
-    for (let x = Math.floor(cx - hw); x <= Math.ceil(cx + hw); x++) {
-      const a = 0.95 * (1 - Math.abs(x - cx) / hw) * (0.6 + 0.4 * noise2(x * 0.2, y * 0.1));
-      blendPix(x, y, [225, 244, 248], a);
-    }
-  }
-  for (let y = HORIZON - 8; y <= HORIZON + 12; y++) {
-    for (let x = IX - 46; x <= IX + 66; x++) {
-      const dx = (x - (IX + 10)) / 52;
-      const dy = (y - (HORIZON + 2)) / 11;
-      if (dx * dx + dy * dy < 1) {
-        blendPix(x, y, [235, 248, 250], 0.55 * (1 - (dx * dx + dy * dy)) * (0.6 + 0.4 * noise2(x * 0.3, y * 0.3)));
-      }
-    }
-  }
-
-  // 5. A smaller sister islet on the right, with one tree.
-  const SX = 856;
-  const STOP = 452;
-  const STIP = 522;
-  for (let y = STOP; y <= STIP; y++) {
-    const hw = y < 486 ? 62 : 62 * Math.pow(1 - (y - 486) / (STIP - 486), 0.7);
-    for (let x = Math.floor(SX - hw); x <= Math.ceil(SX + hw); x++) {
-      const t = clamp((y - STOP) / (STIP - STOP), 0, 1);
-      let c = mix([110, 76, 62], [48, 36, 46], t);
-      if (y < STOP + 10) c = [150, 158, 84];
-      blendPix(x, y, c, 0.9);
-    }
-  }
-  for (let y = STOP - 26; y <= STOP; y++) {
-    for (let x = SX - 12; x <= SX + 12; x++) {
-      const dx = (x - SX) / 12;
-      const dy = (y - (STOP - 12)) / 14;
-      if (dx * dx + dy * dy < 1) blendPix(x, y, [44, 88, 56], 0.9);
-    }
-  }
-
-  // 6. Birds.
-  const birds: [number, number, number][] = [
-    [180, 250, 10],
-    [235, 225, 8],
-    [560, 210, 9],
-    [620, 245, 7],
-    [880, 300, 9],
+// Fixed star field in the deep part of the sky (deterministic positions).
+function drawStars(): void {
+  const stars: Array<[number, number, number, number]> = [
+    [60, 60, 2.2, 0.9], [140, 110, 1.6, 0.6], [230, 50, 2.0, 0.8], [330, 90, 1.5, 0.5],
+    [420, 45, 2.4, 0.9], [520, 80, 1.6, 0.6], [610, 55, 2.0, 0.7], [700, 95, 1.5, 0.5],
+    [790, 48, 2.2, 0.8], [880, 100, 1.6, 0.6], [960, 60, 2.0, 0.8], [100, 180, 1.8, 0.6],
+    [270, 160, 2.2, 0.8], [470, 150, 1.6, 0.5], [660, 170, 2.0, 0.7], [830, 160, 1.8, 0.6],
+    [940, 210, 1.6, 0.5], [180, 260, 1.5, 0.4], [380, 240, 1.8, 0.5], [760, 250, 1.6, 0.5],
+    [30, 300, 1.6, 0.4], [980, 320, 1.5, 0.4], [560, 210, 1.5, 0.4], [40, 140, 1.8, 0.6],
   ];
-  for (const [bx, by, s] of birds) {
-    for (let i = 0; i <= s; i++) {
-      setPix(Math.round(bx - i), Math.round(by + i * 0.45), [30, 40, 58]);
-      setPix(Math.round(bx + i), Math.round(by + i * 0.45), [30, 40, 58]);
-    }
-  }
-
-  // 7. Vignette — gentle darkening at the corners.
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const dx = (x - W / 2) / (W / 2);
-      const dy = (y - H / 2) / (H / 2);
-      const d = Math.sqrt(dx * dx + dy * dy);
-      const v = 1 - 0.16 * smoothstep(0.75, 1.35, d);
-      const o = px(x, y);
-      img[o] = Math.round(img[o] * v);
-      img[o + 1] = Math.round(img[o + 1] * v);
-      img[o + 2] = Math.round(img[o + 2] * v);
-    }
+  for (const [x, y, r, a] of stars) {
+    fillCircle(s(x), s(y), s(r), hex("#fff6d8"), a);
   }
 }
 
-// ------------------------------------------------------------------- lettering
-function textWidth(text: string, scale: number): number {
-  let w = 0;
-  for (const ch of text) {
-    const g = FONT[ch] ?? FONT[" "];
-    void g;
-    w += 6 * scale;
+// The low sun and its glow (smooth radial falloff, no hard rings).
+function drawSun(): void {
+  const cx = s(718);
+  const cy = s(468);
+  const steps = 26;
+  for (let i = steps; i >= 1; i--) {
+    const t = i / steps; // 1 at the outer edge, near 0 at the core
+    const r = 62 + (196 - 62) * t;
+    const c = lerpColor(hex("#ffe9a8"), hex("#ffb35c"), t);
+    const a = 0.06 + 0.34 * (1 - t) * (1 - t);
+    fillCircle(cx, cy, s(r), c, a);
   }
-  return w - scale;
+  fillCircle(cx, cy, s(64), hex("#fff3c4"), 1);
+  fillCircle(cx, cy, s(52), hex("#fffbe0"), 1);
 }
-function drawGlyph(ch: string, x0: number, y0: number, scale: number, c: RGB): void {
-  const g = FONT[ch] ?? FONT[" "];
-  for (let r = 0; r < 7; r++) {
-    for (let col = 0; col < 5; col++) {
-      if (g[r][col] === "#") {
-        for (let dy = 0; dy < scale; dy++) {
-          for (let dx = 0; dx < scale; dx++) {
-            setPix(x0 + col * scale + dx, y0 + r * scale + dy, c);
-          }
+
+// A distant mountain ridge, hazed by the sunset.
+function drawRidge(): void {
+  const c = hex("#5a2d55");
+  fillPoly(
+    [
+      [s(0), s(716)], [s(120), s(688)], [s(260), s(706)], [s(400), s(682)],
+      [s(560), s(704)], [s(700), s(686)], [s(840), s(708)], [s(1024), s(690)],
+      [s(1024), s(760)], [s(0), s(760)],
+    ],
+    c,
+    0.55,
+  );
+}
+
+// The sea of clouds the islands float above: layered warm ellipses.
+function drawCloudSea(): void {
+  const layers: Array<[number, number, number, number, string, number]> = [
+    // x, y, rx, ry, colour, alpha
+    [120, 800, 260, 70, "#e98a7e", 0.9],
+    [420, 830, 300, 80, "#f2a183", 0.95],
+    [760, 810, 280, 75, "#e98a7e", 0.9],
+    [980, 850, 240, 80, "#f2a183", 0.95],
+    [60, 880, 260, 80, "#d97a7e", 0.9],
+    [380, 900, 320, 85, "#e08a7e", 0.95],
+    [720, 890, 300, 85, "#d97a7e", 0.9],
+    [1000, 920, 260, 85, "#e08a7e", 0.95],
+    [200, 950, 300, 90, "#c96a72", 0.95],
+    [560, 960, 320, 90, "#d97a7e", 0.95],
+    [880, 970, 300, 90, "#c96a72", 0.95],
+  ];
+  for (const [x, y, rx, ry, col, a] of layers) {
+    fillEllipse(s(x), s(y), s(rx), s(ry), hex(col), a);
+  }
+  // Soft cloud puffs on the surface, kept faint so they read as mist.
+  const puffs: Array<[number, number, number]> = [
+    [180, 790, 40], [300, 810, 50], [470, 795, 43], [640, 815, 52],
+    [820, 795, 45], [940, 820, 41], [90, 860, 45], [250, 880, 54],
+    [520, 870, 50], [700, 885, 48], [900, 875, 52], [380, 930, 52], [620, 935, 50],
+  ];
+  for (const [x, y, r] of puffs) {
+    fillCircle(s(x), s(y), s(r), hex("#f7c193"), 0.26);
+  }
+}
+
+// A small pine tree (stacked triangles) at (x, baseY), height h (1024-space).
+function drawPine(x: number, baseY: number, h: number, c: RGB): void {
+  const wdt = h * 0.42;
+  for (let i = 0; i < 3; i++) {
+    const t = i / 2;
+    const topY = baseY - h + i * h * 0.28;
+    const half = wdt * (0.55 + t * 0.45);
+    fillPoly(
+      [
+        [s(x), s(topY)],
+        [s(x - half), s(topY + h * 0.42)],
+        [s(x + half), s(topY + h * 0.42)],
+      ],
+      c,
+    );
+  }
+  fillRect(s(x - h * 0.03), s(baseY - h * 0.12), s(x + h * 0.03), s(baseY), hex("#5a3428"));
+}
+
+// A floating island: grassy plateau on top, rocky underside tapering to a point.
+function drawIsland(cx: number, topY: number, halfW: number, depth: number, rock: RGB, grass: RGB): void {
+  // Rocky underside: a smooth, symmetric taper from the plateau to the tip,
+  // with a slight deterministic wobble so the rock edge is not a straight cone.
+  const pts: Array<[number, number]> = [
+    [s(cx - halfW), s(topY)],
+    [s(cx + halfW), s(topY)],
+  ];
+  const steps = 8;
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const wob = ((i * 37) % 5 - 2) * depth * 0.018;
+    const x = cx + halfW * (1 - t) + wob;
+    const y = topY + depth * Math.pow(t, 1.5);
+    pts.push([s(x), s(y)]);
+  }
+  for (let i = steps - 1; i >= 1; i--) {
+    const t = i / steps;
+    const wob = ((i * 53) % 5 - 2) * depth * 0.018;
+    const x = cx - halfW * (1 - t) + wob;
+    const y = topY + depth * Math.pow(t, 1.5);
+    pts.push([s(x), s(y)]);
+  }
+  fillPoly(pts, rock);
+  // Grassy cap.
+  fillEllipse(s(cx), s(topY), s(halfW), s(halfW * 0.16), grass);
+  fillRect(s(cx - halfW), s(topY - halfW * 0.05), s(cx + halfW), s(topY + halfW * 0.1), grass);
+}
+
+// The lighthouse on the main island, with a sweeping beam.
+function drawLighthouse(baseX: number, baseY: number): void {
+  const cream = hex("#f7ead2");
+  const red = hex("#c94f43");
+  const dark = hex("#3a2430");
+  // Light beam, sweeping up-left.
+  fillPoly(
+    [
+      [s(baseX + 6), s(baseY - 118)],
+      [s(baseX - 210), s(baseY - 168)],
+      [s(baseX - 210), s(baseY - 96)],
+    ],
+    hex("#ffe9a8"),
+    0.16,
+  );
+  // Tower: tapered, banded.
+  const topW = 15;
+  const botW = 22;
+  const topY = baseY - 112;
+  fillPoly(
+    [[s(baseX - botW), s(baseY)], [s(baseX + botW), s(baseY)], [s(baseX + topW), s(topY)], [s(baseX - topW), s(topY)]],
+    cream,
+  );
+  // Red bands (clipped by drawing narrower trapezoids at the right heights).
+  const band = (y0: number, y1: number): void => {
+    const f0 = (y0 - topY) / (baseY - topY);
+    const f1 = (y1 - topY) / (baseY - topY);
+    const w0 = topW + (botW - topW) * f0;
+    const w1 = topW + (botW - topW) * f1;
+    fillPoly(
+      [[s(baseX - w0), s(y0)], [s(baseX + w0), s(y0)], [s(baseX + w1), s(y1)], [s(baseX - w1), s(y1)]],
+      red,
+    );
+  };
+  band(baseY - 96, baseY - 74);
+  band(baseY - 52, baseY - 30);
+  // Gallery + lamp room + dome.
+  fillRect(s(baseX - 20), s(topY - 8), s(baseX + 20), s(topY), dark);
+  fillRect(s(baseX - 12), s(topY - 26), s(baseX + 12), s(topY - 8), hex("#ffe9a8"));
+  fillRect(s(baseX - 13), s(topY - 28), s(baseX + 13), s(topY - 26), dark);
+  fillPoly([[s(baseX - 14), s(topY - 28)], [s(baseX + 14), s(topY - 28)], [s(baseX), s(topY - 44)]], red);
+  // Lamp glow.
+  fillCircle(s(baseX), s(topY - 17), s(26), hex("#ffe9a8"), 0.5);
+  fillCircle(s(baseX), s(topY - 17), s(12), hex("#fffbe0"), 0.9);
+}
+
+// Waterfall spilling off the main island into the clouds.
+function drawWaterfall(x: number, y0: number, y1: number): void {
+  const water = hex("#cfe8f2");
+  const white = hex("#f4fbff");
+  fillPoly(
+    [
+      [s(x - 13), s(y0)], [s(x + 13), s(y0)],
+      [s(x + 17), s(y1)], [s(x - 17), s(y1)],
+    ],
+    water,
+    0.92,
+  );
+  thickLine(s(x - 4), s(y0 + 6), s(x - 6), s(y1 - 8), s(5), white, 0.85);
+  thickLine(s(x + 5), s(y0 + 10), s(x + 7), s(y1 - 12), s(4), white, 0.7);
+  // Mist where it meets the clouds.
+  fillEllipse(s(x), s(y1 + 6), s(34), s(14), hex("#f4fbff"), 0.6);
+}
+
+// A small hot-air balloon drifting in the sky.
+function drawBalloon(x: number, y: number): void {
+  const red = hex("#e2574c");
+  const cream = hex("#f7ead2");
+  const gold = hex("#f2a65a");
+  fillEllipse(s(x), s(y), s(36), s(42), red);
+  fillEllipse(s(x), s(y), s(13), s(42), cream);
+  fillEllipse(s(x), s(y), s(5), s(42), gold);
+  fillPoly([[s(x - 14), s(y + 38)], [s(x + 14), s(y + 38)], [s(x + 8), s(y + 52)], [s(x - 8), s(y + 52)]], cream);
+  thickLine(s(x - 12), s(y + 38), s(x - 8), s(y + 52), s(2), hex("#5a3428"), 0.9);
+  thickLine(s(x + 12), s(y + 38), s(x + 8), s(y + 52), s(2), hex("#5a3428"), 0.9);
+  fillRect(s(x - 8), s(y + 52), s(x + 8), s(y + 64), hex("#5a3428"));
+}
+
+// A tiny house with a lit window on the right-hand isle.
+function drawHouse(x: number, baseY: number): void {
+  const wall = hex("#f7ead2");
+  const roof = hex("#c94f43");
+  fillRect(s(x - 16), s(baseY - 26), s(x + 16), s(baseY), wall);
+  fillPoly([[s(x - 20), s(baseY - 26)], [s(x + 20), s(baseY - 26)], [s(x), s(baseY - 44)]], roof);
+  fillRect(s(x - 5), s(baseY - 16), s(x + 5), s(baseY - 6), hex("#ffd98a"));
+  fillRect(s(x - 2), s(baseY - 6), s(x + 2), s(baseY), hex("#5a3428"));
+}
+
+// Birds: simple two-stroke chevrons.
+function drawBirds(): void {
+  const c = hex("#2a1245");
+  const birds: Array<[number, number, number]> = [
+    [300, 330, 10], [340, 300, 8], [380, 340, 9], [820, 280, 10], [870, 320, 8], [910, 290, 9],
+  ];
+  for (const [x, y, r] of birds) {
+    thickLine(s(x - r), s(y), s(x), s(y + r * 0.6), s(3), c, 0.8);
+    thickLine(s(x), s(y + r * 0.6), s(x + r), s(y), s(3), c, 0.8);
+  }
+}
+
+// Dark foreground cliffs framing the bottom corners.
+function drawCliffs(): void {
+  const c = hex("#241233");
+  fillPoly([[s(0), s(1024)], [s(0), s(884)], [s(120), s(936)], [s(300), s(1024)]], c);
+  fillPoly([[s(1024), s(1024)], [s(1024), s(902)], [s(904), s(950)], [s(730), s(1024)]], c);
+  // A pine silhouette on the left cliff.
+  drawPine(84, 936, 64, hex("#1a0d26"));
+}
+
+// The poster's type: name, subtitle, tagline — cream on the dusk sky.
+function drawType(): void {
+  const cream = hex("#fff3d6");
+  const shadow = hex("#2a1245");
+  const cx = OUT_W / 2;
+
+  // Thin cream frame.
+  const f = 26;
+  const fw = 3;
+  fillRect(s(f), s(f), s(OUT_W - f), s(f + fw), cream, 0.45);
+  fillRect(s(f), s(OUT_H - f - fw), s(OUT_W - f), s(OUT_H - f), cream, 0.45);
+  fillRect(s(f), s(f), s(f + fw), s(OUT_H - f), cream, 0.45);
+  fillRect(s(OUT_W - f - fw), s(f), s(OUT_W - f), s(OUT_H - f), cream, 0.45);
+
+  // Title with a soft shadow, then the cream face.
+  const titleScale = 7.9;
+  const titleStroke = 19;
+  const titleY = 96;
+  drawTextCentred(s(cx), s(titleY + 7), "AERTHYS", titleScale * SS, titleStroke * SS, shadow, 0.5);
+  drawTextCentred(s(cx), s(titleY), "AERTHYS", titleScale * SS, titleStroke * SS, cream, 1);
+
+  // Subtitle with a small rule on each side.
+  const subScale = 2.7;
+  const subStroke = 6.5;
+  const subY = 226;
+  const subW = textWidth("THE FLOATING ISLES", subScale);
+  drawTextCentred(s(cx), s(subY), "THE FLOATING ISLES", subScale * SS, subStroke * SS, cream, 1);
+  const gap = 26;
+  const ruleY = subY + 9;
+  fillRect(s(cx - subW / 2 - gap - 92), s(ruleY), s(cx - subW / 2 - gap), s(ruleY + 3), cream, 0.8);
+  fillRect(s(cx + subW / 2 + gap), s(ruleY), s(cx + subW / 2 + gap + 92), s(ruleY + 3), cream, 0.8);
+
+  // Tagline along the bottom, above the cliffs.
+  const tagScale = 2.2;
+  const tagStroke = 5.5;
+  drawTextCentred(s(cx), s(946), "WHERE THE SUN SETS LAST", tagScale * SS, tagStroke * SS, cream, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Downsample the 2x buffer to 1024x1024 RGB and encode.
+// ---------------------------------------------------------------------------
+
+function downsample(): Buffer {
+  const rgb = Buffer.alloc(OUT_W * OUT_H * 3);
+  for (let y = 0; y < OUT_H; y++) {
+    for (let x = 0; x < OUT_W; x++) {
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      for (let dy = 0; dy < SS; dy++) {
+        for (let dx = 0; dx < SS; dx++) {
+          const i = ((y * SS + dy) * W + (x * SS + dx)) * 3;
+          r += buf[i];
+          g += buf[i + 1];
+          b += buf[i + 2];
         }
       }
+      const o = (y * OUT_W + x) * 3;
+      const n = SS * SS;
+      rgb[o] = clamp255(Math.round(r / n));
+      rgb[o + 1] = clamp255(Math.round(g / n));
+      rgb[o + 2] = clamp255(Math.round(b / n));
     }
   }
-}
-function drawText(text: string, cx: number, y0: number, scale: number): void {
-  const w = textWidth(text, scale);
-  let x = Math.round(cx - w / 2);
-  const outline: RGB = [24, 38, 60];
-  const ink: RGB = [255, 244, 214];
-  // Outline pass (8 directions), then the cream face.
-  for (const [ox, oy] of [
-    [-3, 0], [3, 0], [0, -3], [0, 3], [-3, -3], [3, -3], [-3, 3], [3, 3],
-  ] as const) {
-    let xx = x;
-    for (const ch of text) {
-      drawGlyph(ch, xx + ox, y0 + oy, scale, outline);
-      xx += 6 * scale;
-    }
-  }
-  let xx = x;
-  for (const ch of text) {
-    drawGlyph(ch, xx, y0, scale, ink);
-    xx += 6 * scale;
-  }
-  // Thin gold rule + diamond beneath the name.
-  const ry = y0 + 7 * scale + 16;
-  for (let x2 = Math.round(cx - w / 2); x2 <= Math.round(cx + w / 2); x2++) {
-    setPix(x2, ry, [255, 214, 140]);
-    setPix(x2, ry + 1, [200, 160, 90]);
-  }
-  const d = 7;
-  for (let i = -d; i <= d; i++) {
-    for (let j = -d + Math.abs(i); j <= d - Math.abs(i); j++) {
-      setPix(Math.round(cx + i), ry + 22 + j, [255, 214, 140]);
-    }
-  }
+  return rgb;
 }
 
-// ------------------------------------------------------------------- main
 function main(): void {
-  render();
-  drawText("VELMARIS", W / 2, 64, 13);
-  const png = encodePNG(img, W, H);
-  mkdirSync("/output", { recursive: true });
-  writeFileSync(OUT, png);
-  console.log(`wrote ${OUT}: ${W}x${H}, ${png.length} bytes`);
+  drawSky();
+  drawStars();
+  drawSun();
+  drawRidge();
+  drawCloudSea();
+
+  // Main island, centred, with the lighthouse.
+  drawIsland(512, 556, 168, 236, hex("#6b3f4a"), hex("#7fae62"));
+  drawPine(398, 556, 52, hex("#3f6b3a"));
+  drawPine(428, 558, 40, hex("#4a7a42"));
+  drawPine(640, 558, 46, hex("#3f6b3a"));
+  drawLighthouse(520, 556);
+  drawWaterfall(636, 556, 796);
+
+  // Two smaller isles drifting nearby.
+  drawIsland(168, 646, 74, 96, hex("#5a3340"), hex("#6f9a55"));
+  drawPine(168, 646, 44, hex("#3f6b3a"));
+  drawIsland(856, 606, 88, 108, hex("#5a3340"), hex("#6f9a55"));
+  drawHouse(856, 606);
+
+  drawBalloon(228, 296);
+  drawBirds();
+  drawCliffs();
+  drawType();
+
+  const png = encodePNG(downsample(), OUT_W, OUT_H);
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(outDir, "entry.png"), png);
 }
 
 main();
